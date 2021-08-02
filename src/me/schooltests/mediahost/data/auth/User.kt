@@ -2,9 +2,10 @@ package me.schooltests.mediahost.data.auth
 
 import me.schooltests.mediahost.data.content.MediaContent
 import me.schooltests.mediahost.sql.UserTable
+import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
-import java.util.*
+import java.util.Date
 
 data class User(
     val userId: Int,
@@ -17,6 +18,19 @@ data class User(
     val maxUpload: Long
 ) {
     companion object {
+        private fun build(row: ResultRow): User {
+            return User(
+                row[UserTable.userId],
+                row[UserTable.username],
+                row[UserTable.hashedPassword],
+                row[UserTable.salt],
+                row[UserTable.otpSecretKey],
+                Date(row[UserTable.dateCreated]),
+                row[UserTable.fileUploadLimit],
+                row[UserTable.totalUploadLimit]
+            )
+        }
+
         fun from(id: Int): User? {
             return transaction {
                 val results = UserTable.select { UserTable.userId eq id }
@@ -25,16 +39,19 @@ data class User(
                 }
 
                 val result = results.first()
-                return@transaction User(
-                    result[UserTable.userId],
-                    result[UserTable.username],
-                    result[UserTable.hashedPassword],
-                    result[UserTable.salt],
-                    result[UserTable.otpSecretKey],
-                    Date(result[UserTable.dateCreated]),
-                    result[UserTable.fileUploadLimit],
-                    result[UserTable.totalUploadLimit]
-                )
+                return@transaction build(result)
+            }
+        }
+
+        fun from(username: String): User? {
+            return transaction {
+                val results = UserTable.select { UserTable.username eq username }
+                if (results.empty()) {
+                    return@transaction null
+                }
+
+                val result = results.first()
+                return@transaction build(result)
             }
         }
     }
@@ -44,7 +61,7 @@ data class User(
         val contentOwned = MediaContent.queryUser(userId)
         var bytes = 0L
         for (content in contentOwned) {
-            bytes += content.getContentSize()
+            bytes += content.contentSize
         }
 
         return bytes

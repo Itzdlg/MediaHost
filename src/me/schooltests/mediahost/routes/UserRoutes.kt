@@ -3,30 +3,40 @@ package me.schooltests.mediahost.routes
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
-import io.ktor.application.*
-import io.ktor.http.*
-import io.ktor.request.*
-import io.ktor.response.*
-import io.ktor.routing.*
+import io.ktor.application.call
+import io.ktor.http.HttpStatusCode
+import io.ktor.request.receiveText
+import io.ktor.response.respondText
+import io.ktor.routing.Route
+import io.ktor.routing.get
+import io.ktor.routing.post
+import io.ktor.routing.route
 import me.schooltests.mediahost.ApplicationSettings
 import me.schooltests.mediahost.data.auth.APIRights
 import me.schooltests.mediahost.data.auth.APIRights.Companion.toBitMap
 import me.schooltests.mediahost.data.auth.AuthFailure
+import me.schooltests.mediahost.data.auth.AuthSuccessAPI
 import me.schooltests.mediahost.data.auth.AuthSuccessSession
-import me.schooltests.mediahost.managers.UserManager
-import me.schooltests.mediahost.data.auth.User
-import me.schooltests.mediahost.data.auth.UserSession
-import me.schooltests.mediahost.gson
+import me.schooltests.mediahost.data.auth.AuthType
+import me.schooltests.mediahost.data.content.asJson
+import me.schooltests.mediahost.data.content.asJsonObject
 import me.schooltests.mediahost.managers.OTPManager
+import me.schooltests.mediahost.managers.SessionManager
+import me.schooltests.mediahost.managers.UserManager
 import me.schooltests.mediahost.sql.UserAPIKeysTable
 import me.schooltests.mediahost.sql.UserTable
-import me.schooltests.mediahost.util.*
+import me.schooltests.mediahost.util.CharacterRandom
+import me.schooltests.mediahost.util.failedRequest
+import me.schooltests.mediahost.util.getFormattedDateTime
+import me.schooltests.mediahost.util.getOriginAddress
+import me.schooltests.mediahost.util.hash
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.time.Instant
-import java.time.temporal.ChronoUnit
-import java.util.*
+import java.util.Date
+import java.util.EnumSet
+import java.util.UUID
 
 fun Route.userRoutes() {
     route("/api/user") {
@@ -36,7 +46,7 @@ fun Route.userRoutes() {
                 if (!ApplicationSettings.requiredSignupOrigins.contains(origin))
                     return@post failedRequest(
                         "Request must originate from a specific origin to proceed",
-                        HttpStatusCode.Unauthorized
+                        HttpStatusCode.Forbidden
                     )
             }
 
@@ -46,7 +56,7 @@ fun Route.userRoutes() {
                 if (password == null || ApplicationSettings.requiredSignupPasswd != password)
                     return@post failedRequest(
                         "Request must contain a signup authorization (password dictated by the server) to proceed",
-                        HttpStatusCode.Unauthorized
+                        HttpStatusCode.Forbidden
                     )
             }
 
@@ -65,7 +75,7 @@ fun Route.userRoutes() {
                     HttpStatusCode.BadRequest
                 )
 
-            val salt = randomAlphanumerical(32)
+            val salt = CharacterRandom.random(ApplicationSettings.passwordSaltLength, ApplicationSettings.passwordSaltCharset)
             val otpKey = OTPManager.generateSecretKey()
             val hashedSaltedPassword = hash(password + salt)
 
@@ -85,18 +95,7 @@ fun Route.userRoutes() {
             val obj = JsonObject()
             obj.addProperty("otp_secret", otpKey)
 
-            call.respondText(gson.toJson(obj))
-        }
-
-        fun userObj(user: User): JsonObject {
-            val ownerObj = JsonObject()
-            ownerObj.addProperty("id", user.userId)
-            ownerObj.addProperty("name", user.username)
-            ownerObj.addProperty("created", user.dateCreated.time)
-            ownerObj.addProperty("uploaded", user.bytesUploaded)
-            ownerObj.addProperty("max_file_upload", user.maxFileUpload)
-            ownerObj.addProperty("max_total_upload", user.maxUpload)
-            return ownerObj
+            call.respondText(obj.asJson)
         }
 
         get("/info/id/{userId}") {
@@ -105,13 +104,13 @@ fun Route.userRoutes() {
                     "No specified user ID",
                     HttpStatusCode.BadRequest
                 )
-            val user = User.from(userId)
+            val user = UserManager.queryUserById(userId)
                 ?: return@get failedRequest(
                     "The specified user ID is invalid",
                     HttpStatusCode.NotFound
                 )
 
-            return@get call.respondText(gson.toJson(userObj(user)))
+            return@get call.respondText(user.asJsonObject.asJson)
         }
 
         get("/info/username/{username}") {
@@ -126,12 +125,12 @@ fun Route.userRoutes() {
                     HttpStatusCode.NotFound
                 )
 
-            return@get call.respondText(gson.toJson(userObj(user)))
+            return@get call.respondText(user.asJsonObject.asJson)
         }
     }
 
     route("/api/user/apikeys") {
-        get("/list") {
+        get("/") {
             val clientAuth = APIRights.LIST_API_KEYS.allowed(this)
             if (clientAuth is AuthFailure)
                 return@get failedRequest(clientAuth.error, clientAuth.statusCode)
@@ -151,7 +150,7 @@ fun Route.userRoutes() {
                 json.add(obj)
             }
 
-            call.respondText(gson.toJson(json))
+            call.respondText(json.asJson)
         }
 
         post("/generate") {
@@ -172,7 +171,7 @@ fun Route.userRoutes() {
                 }
             }
 
-            val token = randomAlphanumerical(48)
+            val token = CharacterRandom.random(ApplicationSettings.apiTokenLength, ApplicationSettings.apiTokenCharset)
             val id = UUID.randomUUID()
             transaction {
                 UserAPIKeysTable.insert {
@@ -189,54 +188,19 @@ fun Route.userRoutes() {
             obj.addProperty("id", id.toString())
             obj.addProperty("token", token)
 
-            call.respondText(gson.toJson(obj))
+            call.respondText(obj.asJson)
         }
     }
 
     route("/api/user/sessions") {
-        get("/list") {
+        get("/") {
             val clientAuth = APIRights.LIST_SESSIONS.allowed(this)
             if (clientAuth is AuthFailure)
                 return@get failedRequest(clientAuth.error, clientAuth.statusCode)
             val user = clientAuth.user!!
 
-            val sessions = UserManager.querySessions { it.userId == user.userId }
-            val arr = JsonArray()
+            val heldByUser = SessionManager.refreshTokens.filter { token -> token.contains("u" + user.userId) }
 
-            for (session in sessions) {
-                val obj = JsonObject()
-                obj.addProperty("id", session.sessionId.toString())
-                obj.addProperty("ip", session.ip)
-                obj.addProperty("generated_at", getFormattedDateTime(session.created))
-                obj.addProperty("expires_at", getFormattedDateTime(session.expires))
-                arr.add(obj)
-            }
-
-            call.respondText(gson.toJson(arr))
-        }
-
-        post("/expire") {
-            val clientAuth = APIRights.EXPIRE_SESSION.allowed(this)
-            if (clientAuth is AuthFailure)
-                return@post failedRequest(clientAuth.error, clientAuth.statusCode)
-
-            val json = JsonParser.parseString(call.receiveText()).asJsonObject
-            val sessionId = json["id"].asString
-            if (sessionId eqIc "self") {
-                if (clientAuth !is AuthSuccessSession) return@post failedRequest(
-                    "To expire your own session, you must authenticate with a session token.",
-                    HttpStatusCode.BadRequest
-                )
-
-                UserManager.invalidateSession(clientAuth.session.sessionId)
-                return@post call.response.status(HttpStatusCode.OK)
-            }
-
-            val session = UserManager.querySessions { it.sessionId.toString() == sessionId }.firstOrNull()
-                ?: return@post failedRequest("The provided session ID is invalid.", HttpStatusCode.BadRequest)
-
-            UserManager.invalidateSession(session.sessionId)
-            call.response.status(HttpStatusCode.OK)
         }
 
         post("/generate") {
@@ -245,20 +209,41 @@ fun Route.userRoutes() {
                 return@post failedRequest(clientAuth.error, clientAuth.statusCode)
             val user = clientAuth.user!!
 
-            val session = UserSession(
-                userId = user.userId,
-                ip = getOriginAddress(),
-                created = Date(),
-                expires = Date.from(Instant.now().plus(3L, ChronoUnit.HOURS))
+            // Refresh the current JWT
+            if (clientAuth is AuthSuccessSession) {
+                val newJwt = SessionManager.refreshJwt(clientAuth.jwt) ?: return@post failedRequest(
+                    "The provided JWT refresh token is no longer valid.",
+                    HttpStatusCode.Forbidden
+                )
+
+                return@post call.respondText(JsonObject().apply {
+                    addProperty("jwt", newJwt)
+                }.asJson)
+            }
+
+            var permissions = AuthType.SESSION.getRights("")
+            if (clientAuth is AuthSuccessAPI)
+                permissions = clientAuth.apiRights
+
+            // Create a new JWT
+            val newJwt = SessionManager.generateJwt(
+                user,
+                permissions = permissions,
+                customClaims = { claim ->
+                    val namespace = ApplicationSettings.jwtNamespace
+                    val token = "${UUID.randomUUID()}@u${user.userId}:${getOriginAddress()}"
+                    val before = Instant.now().plusSeconds(ApplicationSettings.jwtRefreshExpiration)
+
+                    claim.addProperty(namespace + "refresh/token", token)
+                    claim.addProperty(namespace + "refresh/before", before.epochSecond)
+
+                    SessionManager.validateRefreshToken(token)
+                }
             )
 
-            UserManager.insertSession(session)
-
-            val obj = JsonObject()
-            obj.addProperty("id", session.sessionId.toString())
-            obj.addProperty("token", session.token)
-
-            call.respondText(gson.toJson(obj))
+            return@post call.respondText(JsonObject().apply {
+                addProperty("jwt", newJwt)
+            }.asJson)
         }
     }
 }

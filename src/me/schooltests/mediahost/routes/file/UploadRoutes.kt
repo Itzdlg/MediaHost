@@ -12,54 +12,72 @@ import io.ktor.response.respondText
 import io.ktor.routing.Route
 import io.ktor.routing.get
 import io.ktor.routing.post
+import io.ktor.routing.put
 import io.ktor.routing.route
 import me.schooltests.mediahost.ApplicationSettings
 import me.schooltests.mediahost.data.auth.APIRights
 import me.schooltests.mediahost.data.auth.AuthFailure
 import me.schooltests.mediahost.data.content.PrivacyType
-import me.schooltests.mediahost.gson
-import me.schooltests.mediahost.managers.UploadManager
+import me.schooltests.mediahost.data.content.UploadStream
+import me.schooltests.mediahost.data.content.asJson
+import me.schooltests.mediahost.data.content.asJsonObject
+import me.schooltests.mediahost.managers.ChunkedUploadManager
 import me.schooltests.mediahost.managers.UserManager
 import me.schooltests.mediahost.sql.MediaPropertiesTable
+import me.schooltests.mediahost.util.CharacterRandom
 import me.schooltests.mediahost.util.failedRequest
-import me.schooltests.mediahost.util.randomAlphanumerical
 import org.jetbrains.exposed.sql.insert
 import java.util.UUID
 
 fun Route.uploadRoutes() {
     route("/api/file/upload") {
         // Upload a file straight, no chunks
-        post("/") {
+        put("/") {
             var user = UserManager.queryUserByUsername(ApplicationSettings.defaultUser)!!
             val clientAuth = APIRights.UPLOAD_FILE.allowed(this)
             if (clientAuth is AuthFailure && !ApplicationSettings.allowNoUserUpload)
-                return@post failedRequest(clientAuth.error, clientAuth.statusCode)
+                return@put failedRequest(clientAuth.error, clientAuth.statusCode)
             else if (clientAuth.user != null)
                 user = clientAuth.user!!
 
             val multipart = call.receiveMultipart()
-            val filePart = multipart.readPart() as? PartData.FileItem ?: return@post failedRequest(
+            val filePart = multipart.readPart() as? PartData.FileItem ?: return@put failedRequest(
                 "Unspecified multipart.",
                 HttpStatusCode.BadRequest
             )
 
-            val buffer = filePart.streamProvider().buffered()
+            val json = JsonParser.parseString(call.receiveText()).asJsonObject
+            val fileSize = json["size"].asInt
+
             val maxLeft = if (user.maxUpload - user.bytesUploaded > Integer.MAX_VALUE) Integer.MAX_VALUE else (user.maxUpload - user.bytesUploaded).toInt()
             val maximumUpload = maxLeft.coerceAtMost(user.maxFileUpload)
 
-            val stream = me.schooltests.mediahost.data.content.UploadStream(
+            if (fileSize > maximumUpload)
+                return@put failedRequest(
+                    "The file size exceeds the maximum allotted space for the account",
+                    HttpStatusCode.PayloadTooLarge
+                )
+
+            if (fileSize > ApplicationSettings.maxUploadNotChunked)
+                return@put failedRequest(
+                    "The file size exceeds the maximum upload limit for non-chunked uploads",
+                    HttpStatusCode.PayloadTooLarge
+                )
+
+            val stream = UploadStream(
                 user,
-                randomAlphanumerical(7),
-                maximumUpload
+                CharacterRandom.random(ApplicationSettings.contentIdLength, ApplicationSettings.contentIdCharset),
+                fileSize
             )
 
+            val buffer = filePart.streamProvider().buffered()
             for (byte in buffer.iterator()) {
                 try {
                     stream.push(byte)
                 } catch (ex: IllegalStateException) {
                     stream.clear(0)
-                    return@post failedRequest(
-                        "You may not exceed your upload limit (${user.bytesUploaded}/${user.maxUpload}) (max ${user.maxFileUpload} per/file)",
+                    return@put failedRequest(
+                        "You may not exceed your upload limit of ${user.maxUpload} bytes (max ${user.maxFileUpload} per file)",
                         HttpStatusCode.PayloadTooLarge
                     )
                 }
@@ -114,8 +132,8 @@ fun Route.uploadRoutes() {
                     HttpStatusCode.PayloadTooLarge
                 )
 
-            val contentId = randomAlphanumerical(7)
-            return@post call.respondText(UploadManager.newStream(user, contentId, totalSize).toString())
+            val contentId = CharacterRandom.random(ApplicationSettings.contentIdLength, ApplicationSettings.contentIdCharset)
+            return@post call.respondText(ChunkedUploadManager.newStream(user, contentId, totalSize).toString())
         }
 
         post("/upstream/{id}") {
@@ -126,7 +144,7 @@ fun Route.uploadRoutes() {
                 )
             )
 
-            val stream = UploadManager.getStream(streamId) ?: return@post failedRequest(
+            val stream = ChunkedUploadManager.getStream(streamId) ?: return@post failedRequest(
                 "The specified stream ID is invalid",
                 HttpStatusCode.ResetContent
             )
@@ -157,7 +175,7 @@ fun Route.uploadRoutes() {
                 )
             )
 
-            val stream = UploadManager.getStream(streamId) ?: return@post failedRequest(
+            val stream = ChunkedUploadManager.getStream(streamId) ?: return@post failedRequest(
                 "The specified stream ID is invalid",
                 HttpStatusCode.ResetContent
             )
@@ -187,7 +205,7 @@ fun Route.uploadRoutes() {
                 )
             )
 
-            val stream = UploadManager.getStream(streamId) ?: return@post failedRequest(
+            val stream = ChunkedUploadManager.getStream(streamId) ?: return@post failedRequest(
                 "The specified stream ID is invalid",
                 HttpStatusCode.ResetContent
             )
@@ -210,13 +228,13 @@ fun Route.uploadRoutes() {
                 )
             )
 
-            val stream = UploadManager.getStream(streamId) ?: return@post failedRequest(
+            val stream = ChunkedUploadManager.getStream(streamId) ?: return@post failedRequest(
                 "The specified stream ID is invalid",
                 HttpStatusCode.ResetContent
             )
 
             stream.clear(0)
-            UploadManager.expireStream(streamId)
+            ChunkedUploadManager.expireStream(streamId)
 
             return@post call.response.status(HttpStatusCode.NotFound)
         }
@@ -229,16 +247,12 @@ fun Route.uploadRoutes() {
                 )
             )
 
-            val stream = UploadManager.getStream(streamId) ?: return@get failedRequest(
+            val stream = ChunkedUploadManager.getStream(streamId) ?: return@get failedRequest(
                 "The specified stream ID is invalid",
                 HttpStatusCode.ResetContent
             )
 
-            val obj = JsonObject()
-            obj.addProperty("uploaded", stream.alreadyUploaded)
-            obj.addProperty("expecting", stream.totalSize)
-            obj.addProperty("finished", stream.isFinished)
-            return@get call.respondText(gson.toJson(obj))
+            return@get call.respondText(stream.asJsonObject.asJson)
         }
     }
 }

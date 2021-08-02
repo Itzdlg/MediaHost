@@ -9,7 +9,7 @@ import java.util.Date
 import java.util.UUID
 import kotlin.concurrent.schedule
 
-object UploadManager {
+object ChunkedUploadManager {
     private val currentUploads: MutableMap<UUID, UploadStream> = mutableMapOf()
 
     fun newStream(user: User, contentId: String, totalSize: Int): UUID {
@@ -18,7 +18,7 @@ object UploadManager {
 
         currentUploads[id] = stream
 
-        timer.schedule(Date.from(Instant.now().plus(1, ChronoUnit.HOURS))) {
+        timer.schedule(Date.from(Instant.now().plus(3, ChronoUnit.HOURS))) {
             expireStream(id)
         }
 

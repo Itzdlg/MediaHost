@@ -4,13 +4,13 @@ import com.google.gson.GsonBuilder
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.application.Application
 import io.ktor.application.install
-import io.ktor.features.HttpsRedirect
 import io.ktor.http.HttpMethod
 import io.ktor.http.content.default
 import io.ktor.http.content.files
 import io.ktor.http.content.static
 import io.ktor.routing.routing
 import me.schooltests.mediahost.routes.file.fileRoutes
+import me.schooltests.mediahost.routes.file.searchRoutes
 import me.schooltests.mediahost.routes.miscRoutes
 import me.schooltests.mediahost.routes.userRoutes
 import me.schooltests.mediahost.sql.MediaContentTable
@@ -35,19 +35,8 @@ fun main(_args: Array<String>): Unit {
 }
 
 @Suppress("unused") // Referenced in application.conf
-@kotlin.jvm.JvmOverloads
-fun Application.module(testing: Boolean = false) {
+fun Application.module() {
     initDb()
-
-    // https://ktor.io/servers/features/https-redirect.html#testing
-    if (!testing) {
-        install(HttpsRedirect) {
-            // The port to redirect to. By default 443, the default HTTPS port.
-            sslPort = 1818
-            // 301 Moved Permanently, or 302 Found redirect.
-            permanentRedirect = true
-        }
-    }
 
     install(RateLimiting) {
         this.limit = 120
@@ -67,6 +56,7 @@ fun Application.module(testing: Boolean = false) {
 
         userRoutes()
         fileRoutes()
+        searchRoutes()
         miscRoutes()
 
         static("/") {

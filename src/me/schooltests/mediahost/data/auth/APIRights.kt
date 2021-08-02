@@ -6,8 +6,8 @@ import io.ktor.application.ApplicationCall
 import io.ktor.http.HttpStatusCode
 import io.ktor.request.header
 import io.ktor.util.pipeline.PipelineContext
-import me.schooltests.mediahost.ApplicationSettings
 import me.schooltests.mediahost.managers.OTPManager
+import me.schooltests.mediahost.managers.SessionManager
 import me.schooltests.mediahost.managers.UserManager
 import me.schooltests.mediahost.sql.UserAPIKeysTable
 import me.schooltests.mediahost.util.eqIc
@@ -15,6 +15,7 @@ import me.schooltests.mediahost.util.hash
 import org.apache.commons.codec.binary.Base64
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
+import java.time.Instant
 import java.util.EnumSet
 
 /*
@@ -23,7 +24,7 @@ Rights with requireOTP=true can be executed if the permission is set, but the AP
 would require a OTP from the user OR the OTP Secret to make one.
  */
 
-enum class APIRights(val permId: Int, val descriptor: String, val requireOTP: Boolean = false) {
+enum class APIRights(val permId: Int, val description: String, val requireOTP: Boolean = false) {
     CHANGE_USERNAME(1, "Change your username"),
     RESET_PASSWORD(2, "Reset your password", requireOTP = true),
     GENERATE_API_KEY(3, "Generate an API key"),
@@ -39,6 +40,8 @@ enum class APIRights(val permId: Int, val descriptor: String, val requireOTP: Bo
     QUERY_CONTENT(13, "Query uploads"),
     DELETE_ACCOUNT(14, "Delete account", requireOTP = true);
 
+    val binary = 1L shl permId
+
     companion object {
         fun getById(id: Int): APIRights? {
             return values().toList().stream().filter{ it.permId == id }.findFirst().orElse(null)
@@ -47,26 +50,23 @@ enum class APIRights(val permId: Int, val descriptor: String, val requireOTP: Bo
         fun EnumSet<APIRights>.toBitMap(): Long {
             var ret = 0L
             for (right in this) {
-                ret = ret or (1L shl right.permId)
+                ret = ret or right.binary
             }
 
             return ret
         }
 
         fun fromBitMap(code: Long): EnumSet<APIRights> {
-            var m = code
-            val result = EnumSet.noneOf(APIRights::class.java)
-            while (m != 0L) {
-                val ordinal = java.lang.Long.numberOfTrailingZeros(m)
-                m = m xor java.lang.Long.lowestOneBit(m)
-                result.add(getById(ordinal))
+            val rights = EnumSet.noneOf(APIRights::class.java)
+            for (right in values()) {
+                if (code and right.binary == right.binary) rights.add(right)
             }
-            return result
+
+            return rights
         }
     }
 
-    fun allowed(type: AuthType, data: String, otp: String?, behalf: String?): ClientAuthentication {
-        var overrideOTPRequirement = false
+    fun allowed(type: AuthType, data: String, otp: String?): ClientAuthentication {
         fun allowedBasic(username: String, password: String): ClientAuthentication {
             val user = UserManager.queryUserByUsername(username)
                 ?: return AuthFailure("There is no user with that username.", HttpStatusCode.NotFound)
@@ -74,50 +74,34 @@ enum class APIRights(val permId: Int, val descriptor: String, val requireOTP: Bo
                 val userRights = AuthType.BASIC.getRights("$username:$password")
                 return if (userRights.contains(this)) {
                     AuthSuccessBasic(user)
-                } else AuthFailure("You may not perform this action.", HttpStatusCode.Forbidden)
+                } else AuthFailure("You may not perform this action.", HttpStatusCode.Unauthorized)
             }
 
-            return AuthFailure("Something went wrong.", HttpStatusCode.InternalServerError)
+            return AuthFailure("The provided password is incorrect.", HttpStatusCode.Unauthorized)
         }
 
         fun allowedAPI(apikey: String): ClientAuthentication {
-            if (ApplicationSettings.adminKeys.contains(apikey)) {
-                val username = behalf ?: return AuthFailure(
-                    "No X-Behalf-Of header for specified Admin API Key,",
-                    HttpStatusCode.BadRequest
-                )
-
-                val user = UserManager.queryUserByUsername(username) ?: return AuthFailure(
-                    "X-Behalf-Of specified username does not exist.",
-                    HttpStatusCode.BadRequest
-                )
-
-                val rights = EnumSet.allOf(APIRights::class.java)
-
-                overrideOTPRequirement = true
-                return AuthSuccessAPI(user, apikey, rights)
-            }
-
             val userId = transaction {
                 UserAPIKeysTable.select { UserAPIKeysTable.hashedToken eq hash(apikey) }.firstOrNull()?.get(UserAPIKeysTable.userId)
             } ?: return AuthFailure("The specified API key is invalid.", HttpStatusCode.NotFound)
 
-            val user = User.from(userId) ?: return AuthFailure("Something went wrong.", HttpStatusCode.InternalServerError)
+            val user = UserManager.queryUserById(userId) ?: return AuthFailure("Something went wrong.", HttpStatusCode.InternalServerError)
             val rights = AuthType.API.getRights(apikey)
 
             return if (rights.contains(this)) AuthSuccessAPI(user, apikey, rights)
-            else AuthFailure("You may not perform this action.", HttpStatusCode.Forbidden)
+            else AuthFailure("You may not perform this action.", HttpStatusCode.Unauthorized)
         }
 
-        fun allowedSession(sessionToken: String): ClientAuthentication {
-            val session = UserManager.querySessions { it.token == sessionToken }.firstOrNull()
-                ?: return AuthFailure("The specified session is invalid.", HttpStatusCode.NotFound)
+        fun allowedSession(jwt: String): ClientAuthentication {
+            val obj = SessionManager.decodeJwt(jwt) ?: return AuthFailure("Improper JWT provided.", HttpStatusCode.BadRequest)
+            val expiration = Instant.ofEpochSecond(obj["exp"].asLong)
+            if (Instant.now().isAfter(expiration)) return AuthFailure("Expired JWT provided.", HttpStatusCode.Unauthorized)
 
-            val user = User.from(session.userId) ?: return AuthFailure("Something went wrong.", HttpStatusCode.InternalServerError)
-            val rights = AuthType.SESSION.getRights(sessionToken)
+            val permissions = APIRights.fromBitMap(obj["scope"].asLong)
+            if (!permissions.contains(this)) return AuthFailure("You may not perform this action.", HttpStatusCode.Unauthorized)
 
-            return if (rights.contains(this)) AuthSuccessSession(user, session)
-            else AuthFailure("You may not perform this action.", HttpStatusCode.Forbidden)
+            val user = UserManager.queryUserById(obj["sub"].asInt) ?: return AuthFailure("Improper JWT provided.", HttpStatusCode.BadRequest)
+            return AuthSuccessSession(user, obj)
         }
 
         val clientAuthentication = when (type) {
@@ -132,12 +116,12 @@ enum class APIRights(val permId: Int, val descriptor: String, val requireOTP: Bo
         }
 
         if (clientAuthentication is AuthFailure) return clientAuthentication
-        if (requireOTP && !overrideOTPRequirement) {
+        if (requireOTP) {
             if (otp == null) return AuthFailure("OTP not provided.", HttpStatusCode.BadRequest)
             val user: User = clientAuthentication.user!!
             val newOTP = OTPManager.generateOTP(user.otpSecret)
             if (otp != newOTP) {
-                return AuthFailure("Incorrect OTP provided.", HttpStatusCode.Forbidden)
+                return AuthFailure("Incorrect OTP provided.", HttpStatusCode.Unauthorized)
             }
         }
 
@@ -146,20 +130,15 @@ enum class APIRights(val permId: Int, val descriptor: String, val requireOTP: Bo
 
     fun allowed(call: PipelineContext<*, ApplicationCall>): ClientAuthentication {
         val authHeader = call.context.request.header("Authorization")
-        val apiHeader = call.context.request.header("X-API-Key")
         val otpHeader = call.context.request.header("X-OTP")
-        val behalfHeader = call.context.request.header("X-Behalf-Of")
-
-        if (apiHeader != null) {
-            return allowed(AuthType.API, apiHeader, otpHeader, behalfHeader)
-        }
 
         if (authHeader != null && authHeader.contains(" ")) {
             val type = authHeader.split(" ")[0]
             val data = authHeader.split(" ")[1]
 
-            if (type eqIc "Basic") return allowed(AuthType.BASIC, data, otpHeader, null)
-            else if (type eqIc "Bearer") return allowed(AuthType.SESSION, data, otpHeader, null)
+            if (type eqIc "Basic") return allowed(AuthType.BASIC, data, otpHeader)
+            else if (type eqIc "Bearer") return allowed(AuthType.SESSION, data, otpHeader)
+            else if (type eqIc "Apikey") return allowed(AuthType.API, data, otpHeader)
         }
 
         return AuthFailure("Improper Authentication Header.", HttpStatusCode.BadRequest)

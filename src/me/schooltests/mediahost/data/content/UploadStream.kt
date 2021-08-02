@@ -1,6 +1,5 @@
 package me.schooltests.mediahost.data.content
 
-import com.google.protobuf.BytesValue
 import me.schooltests.mediahost.BLOB_PER_ROW
 import me.schooltests.mediahost.data.auth.User
 import me.schooltests.mediahost.sql.MediaContentTable
@@ -10,7 +9,6 @@ import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.statements.api.ExposedBlob
 import org.jetbrains.exposed.sql.transactions.transaction
-import java.lang.IllegalStateException
 
 class UploadStream(val user: User, val contentId: String, val totalSize: Int) {
     var alreadyUploaded: Int = 0
@@ -62,7 +60,7 @@ class UploadStream(val user: User, val contentId: String, val totalSize: Int) {
             MediaContentTable.insert {
                 it[contentId] = this@UploadStream.contentId
                 it[totalSize] = this@UploadStream.totalSize
-                it[compressed] = data.contentEquals(buffer)
+                it[compressed] = !data.contentEquals(buffer)
 
                 it[content] = ExposedBlob(data)
                 it[index] = bufferIndex

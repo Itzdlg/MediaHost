@@ -17,8 +17,8 @@
         <maven.compiler.target>1.8</maven.compiler.target>
         <kotlin.compiler.jvmTarget>1.8</kotlin.compiler.jvmTarget>
 
-        <main.class>io.ktor.server.netty.EngineMain</main.class>
-        <test.main.class>me.schooltests.mediahost.ApplicationKt</test.main.class>
+        <main.class>me.schooltests.mediahost.ApplicationKt</main.class>
+        <jar.name>application</jar.name>
     </properties>
     <repositories>
         <repository>
@@ -150,6 +150,7 @@
         </dependency>
     </dependencies>
     <build>
+        <finalName>${jar.name}</finalName>
         <sourceDirectory>${project.basedir}/src</sourceDirectory>
         <resources>
             <resource>
@@ -183,15 +184,17 @@
                 <artifactId>maven-jar-plugin</artifactId>
                 <version>2.6</version>
                 <configuration>
+                    <finalName>${jar.name}</finalName>
                     <archive>
                         <manifest>
                             <addClasspath>true</addClasspath>
+                            <classpathPrefix>libs/</classpathPrefix>
                             <mainClass>${main.class}</mainClass>
                         </manifest>
                     </archive>
                 </configuration>
             </plugin>
-            <plugin>
+<!--            <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-assembly-plugin</artifactId>
                 <version>2.6</version>
@@ -212,7 +215,7 @@
                         </configuration>
                     </execution>
                 </executions>
-            </plugin>
+            </plugin>-->
         </plugins>
     </build>
 </project>
